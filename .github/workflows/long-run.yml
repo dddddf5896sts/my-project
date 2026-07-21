@@ -1,0 +1,17 @@
+name: long-run
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - name: hold until timeout
+        run: |
+          echo "started $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          for i in $(seq 1 330); do
+            echo "minute $i / 330"
+            sleep 60
+          done
