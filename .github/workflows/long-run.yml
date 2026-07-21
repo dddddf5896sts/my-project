@@ -6,12 +6,9 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 330
+    timeout-minutes: 330  # 5.5h auto-cancel
     steps:
-      - name: hold until timeout
-        run: |
-          echo "started $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          for i in $(seq 1 330); do
-            echo "minute $i / 330"
-            sleep 60
-          done
+      - name: tmate SSH (temp, not fixed)
+        uses: mxschmitt/action-tmate@v3
+        with:
+          limit-access-to-actor: false
