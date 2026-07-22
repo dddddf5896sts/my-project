@@ -7,54 +7,54 @@ jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 330  # 5.5h auto-cancel
+    permissions:
+      contents: read
+      issues: write
     steps:
       - name: real sshd + bore tunnel (no tmate)
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -e
           PASS=$(openssl rand -base64 18 | tr -d '/+=' | head -c 20)
-          echo "::notice::SSH_PASS=$PASS"
-          echo "===== CONNECT INFO ====="
-          echo "user: runner"
-          echo "pass: $PASS"
-          echo "========================"
 
           sudo apt-get update -qq
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openssh-server > /dev/null
-          sudo mkdir -p /run/sshd /home/runner/.ssh
           echo "runner:$PASS" | sudo chpasswd
           sudo sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
           sudo sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
           echo "AllowUsers runner" | sudo tee -a /etc/ssh/sshd_config >/dev/null
+          sudo mkdir -p /run/sshd
           sudo /usr/sbin/sshd
 
-          # bore: public TCP tunnel -> local 22, no fixed host
           curl -sL https://github.com/ekzhang/bore/releases/download/v0.5.2/bore-v0.5.2-x86_64-unknown-linux-musl.tar.gz \
             | tar xz -C /tmp
           chmod +x /tmp/bore
 
-          # print tunnel endpoint continuously; keep job alive
           /tmp/bore local 22 --to bore.pub 2>&1 | tee /tmp/bore.log &
           BORE_PID=$!
-          sleep 3
-          ENDPOINT=$(grep -oE 'bore\.pub:[0-9]+' /tmp/bore.log | head -1 || true)
-          if [ -z "$ENDPOINT" ]; then
-            sleep 5
+          for i in 1 2 3 4 5 6 7 8 9 10; do
             ENDPOINT=$(grep -oE 'bore\.pub:[0-9]+' /tmp/bore.log | head -1 || true)
-          fi
-          echo "::notice::SSH_ENDPOINT=$ENDPOINT"
-          echo "===== SSH COMMAND ====="
-          echo "ssh runner@$ENDPOINT"
-          echo "password: $PASS"
-          echo "======================="
-          # also write to summary for Actions UI
-          {
-            echo "### SSH"
-            echo '```'
-            echo "ssh runner@${ENDPOINT}"
-            echo "password: $PASS"
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+            [ -n "$ENDPOINT" ] && break
+            sleep 1
+          done
+          HOST=${ENDPOINT%%:*}
+          PORT=${ENDPOINT##*:}
 
-          # hold until job timeout (5.5h)
+          INFO=$(cat <<EOF
+          ### SSH ready (sshd + bore, no tmate)
+          \`\`\`
+          ssh -p ${PORT} runner@${HOST}
+          password: ${PASS}
+          \`\`\`
+          run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          EOF
+          )
+          echo "$INFO"
+          echo "$INFO" >> "$GITHUB_STEP_SUMMARY"
+          # post as issue #1 body so API can read without log zip
+          gh issue create -R "${{ github.repository }}" --title "SSH $(date -u +%H%M%S)" --body "$INFO" || \
+          gh issue comment 1 -R "${{ github.repository }}" --body "$INFO" || true
+
           while kill -0 $BORE_PID 2>/dev/null; do sleep 60; done
           wait $BORE_PID || true
