@@ -11,19 +11,21 @@ jobs:
       contents: read
       issues: write
     steps:
-      - name: sshd key-only + bore fixed port
+      - name: sshd key-only + bore random port
         env:
           GH_TOKEN: ${{ github.token }}
-          # preferred public port on bore.pub (may be taken → fallback random)
-          BORE_PORT: "22222"
+          SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
         run: |
           set -e
-          PUBKEY='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIfld7KPE9rQIKmjc8liwGyDw0xjX7YtUVVJ13KbLkmD gha-runner-dddd'
+          if [ -z "$SSH_PUBLIC_KEY" ]; then
+            echo "missing secret SSH_PUBLIC_KEY" >&2
+            exit 1
+          fi
 
           sudo apt-get update -qq
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openssh-server > /dev/null
           sudo mkdir -p /home/runner/.ssh /run/sshd
-          echo "$PUBKEY" | sudo tee /home/runner/.ssh/authorized_keys >/dev/null
+          printf '%s\n' "$SSH_PUBLIC_KEY" | sudo tee /home/runner/.ssh/authorized_keys >/dev/null
           sudo chown -R runner:runner /home/runner/.ssh
           sudo chmod 700 /home/runner/.ssh
           sudo chmod 600 /home/runner/.ssh/authorized_keys
@@ -45,36 +47,23 @@ jobs:
           curl -sL https://github.com/ekzhang/bore/releases/download/v0.5.2/bore-v0.5.2-x86_64-unknown-linux-musl.tar.gz \
             | tar xz -C /tmp
           chmod +x /tmp/bore
-
-          # try fixed port first; if occupied, fall back to random
-          set +e
-          /tmp/bore local 22 --to bore.pub --port "$BORE_PORT" 2>&1 | tee /tmp/bore.log &
+          /tmp/bore local 22 --to bore.pub 2>&1 | tee /tmp/bore.log &
           BORE_PID=$!
-          sleep 3
-          if ! kill -0 $BORE_PID 2>/dev/null || ! grep -qE 'bore\.pub:[0-9]+|listening' /tmp/bore.log; then
-            kill $BORE_PID 2>/dev/null || true
-            wait $BORE_PID 2>/dev/null || true
-            echo "port $BORE_PORT busy → random"
-            /tmp/bore local 22 --to bore.pub 2>&1 | tee /tmp/bore.log &
-            BORE_PID=$!
-          fi
-          set -e
           for i in $(seq 1 20); do
             ENDPOINT=$(grep -oE 'bore\.pub:[0-9]+' /tmp/bore.log | head -1 || true)
             [ -n "$ENDPOINT" ] && break
             sleep 1
           done
-          HOST=${ENDPOINT%%:*}
           PORT=${ENDPOINT##*:}
 
           INFO=$(cat <<EOF
-          ### SSH key-only (sshd + bore)
-          preferred fixed: \`bore.pub:${BORE_PORT}\`
-          actual this run: \`bore.pub:${PORT}\`
+          ### SSH key-only (sshd + bore, random port)
+          host: \`bore.pub\`  port: \`${PORT}\`
+          authorized_keys from secret \`SSH_PUBLIC_KEY\` (stable)
           \`\`\`
           ssh -i %USERPROFILE%\\.ssh\\gha_runner_ed25519 -p ${PORT} runner@bore.pub
           \`\`\`
-          key-only, no password. run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           EOF
           )
           echo "$INFO"
