@@ -11,29 +11,44 @@ jobs:
       contents: read
       issues: write
     steps:
-      - name: real sshd + bore tunnel (no tmate)
+      - name: sshd key-only + bore (no password, no tmate)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -e
-          PASS=$(openssl rand -base64 18 | tr -d '/+=' | head -c 20)
+          # pubkey only — password auth OFF (public issue had pass → scanned)
+          PUBKEY='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIfld7KPE9rQIKmjc8liwGyDw0xjX7YtUVVJ13KbLkmD gha-runner-dddd'
 
           sudo apt-get update -qq
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openssh-server > /dev/null
-          echo "runner:$PASS" | sudo chpasswd
-          sudo sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
-          sudo sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
-          echo "AllowUsers runner" | sudo tee -a /etc/ssh/sshd_config >/dev/null
-          sudo mkdir -p /run/sshd
+
+          sudo mkdir -p /home/runner/.ssh /run/sshd
+          echo "$PUBKEY" | sudo tee /home/runner/.ssh/authorized_keys >/dev/null
+          sudo chown -R runner:runner /home/runner/.ssh
+          sudo chmod 700 /home/runner/.ssh
+          sudo chmod 600 /home/runner/.ssh/authorized_keys
+
+          # harden: key only, no password
+          sudo tee /etc/ssh/sshd_config.d/99-gha.conf >/dev/null <<'CFG'
+          PasswordAuthentication no
+          KbdInteractiveAuthentication no
+          ChallengeResponseAuthentication no
+          PermitRootLogin no
+          AllowUsers runner
+          PubkeyAuthentication yes
+          MaxAuthTries 3
+          ClientAliveInterval 30
+          ClientAliveCountMax 120
+          LoginGraceTime 20
+          CFG
           sudo /usr/sbin/sshd
 
           curl -sL https://github.com/ekzhang/bore/releases/download/v0.5.2/bore-v0.5.2-x86_64-unknown-linux-musl.tar.gz \
             | tar xz -C /tmp
           chmod +x /tmp/bore
-
           /tmp/bore local 22 --to bore.pub 2>&1 | tee /tmp/bore.log &
           BORE_PID=$!
-          for i in 1 2 3 4 5 6 7 8 9 10; do
+          for i in $(seq 1 20); do
             ENDPOINT=$(grep -oE 'bore\.pub:[0-9]+' /tmp/bore.log | head -1 || true)
             [ -n "$ENDPOINT" ] && break
             sleep 1
@@ -42,19 +57,24 @@ jobs:
           PORT=${ENDPOINT##*:}
 
           INFO=$(cat <<EOF
-          ### SSH ready (sshd + bore, no tmate)
+          ### SSH key-only (sshd + bore)
+          Host fixed: \`bore.pub\`  Port this run: \`${PORT}\`
           \`\`\`
-          ssh -p ${PORT} runner@${HOST}
-          password: ${PASS}
+          ssh -i id_ed25519 -p ${PORT} runner@${HOST}
           \`\`\`
-          run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          no password — key only. run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           EOF
           )
           echo "$INFO"
           echo "$INFO" >> "$GITHUB_STEP_SUMMARY"
-          # post as issue #1 body so API can read without log zip
-          gh issue create -R "${{ github.repository }}" --title "SSH $(date -u +%H%M%S)" --body "$INFO" || \
-          gh issue comment 1 -R "${{ github.repository }}" --body "$INFO" || true
+          # update sticky issue #1 (no secrets in body)
+          if gh issue view 1 -R "${{ github.repository }}" >/dev/null 2>&1; then
+            gh issue reopen 1 -R "${{ github.repository }}" 2>/dev/null || true
+            gh issue edit 1 -R "${{ github.repository }}" --title "SSH port (key-only)" --body "$INFO"
+          else
+            gh issue create -R "${{ github.repository }}" --title "SSH port (key-only)" --body "$INFO" || true
+          fi
 
+          # keep tunnel + sshd alive
           while kill -0 $BORE_PID 2>/dev/null; do sleep 60; done
           wait $BORE_PID || true
