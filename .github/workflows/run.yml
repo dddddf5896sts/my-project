@@ -125,6 +125,8 @@ jobs:
         env:
           TUNNEL_TOKEN: ${{ secrets.TUNNEL_TOKEN }}
           VSCODE_PASSWORD: ${{ secrets.VSCODE_PASSWORD }}
+          MCP_HOSTNAME: ${{ secrets.MCP_HOSTNAME }}
+          MCP_BEARER: ${{ secrets.MCP_BEARER }}
         run: |
           set -e
           PASS="${VSCODE_PASSWORD:-vscode123}"
@@ -154,6 +156,25 @@ jobs:
           echo "cloudflared 日志尾:"
           tail -n 20 /tmp/cloudflared.log || true
           echo "============================================================="
+
+          # freebuff 接本地 coding-tools-mcp (远端 HTTP, 读 E:\game)
+          # mcp.json 是 freebuff/codebuff 项目级 MCP 配置, 需配合 --trust-agents 免确认加载
+          if [ -n "${MCP_HOSTNAME:-}" ] && [ -n "${MCP_BEARER:-}" ]; then
+            mkdir -p ~/work && cat > ~/work/mcp.json <<EOF
+          {
+            "mcpServers": {
+              "coding-tools": {
+                "type": "http",
+                "url": "https://${MCP_HOSTNAME}/mcp",
+                "headers": { "Authorization": "Bearer ${MCP_BEARER}" }
+              }
+            }
+          }
+          EOF
+            echo "freebuff mcp.json 已写入 ~/work/mcp.json -> https://${MCP_HOSTNAME}/mcp"
+          else
+            echo "MCP_HOSTNAME/MCP_BEARER 未配, 跳过 freebuff MCP (本地服务仍可直连 127.0.0.1:8765)"
+          fi
 
           # 3) 保活 5.5h = 19800s, 到点 job 因 timeout-minutes:330 自动结束
           echo "保活开始: 19800s (5.5h)..."
