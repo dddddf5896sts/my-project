@@ -10,7 +10,74 @@ jobs:
   vscode:
     runs-on: ubuntu-latest
     timeout-minutes: 330 # 5.5h 到点强制停止
+    permissions:
+      contents: read
+      issues: write
     steps:
+      - name: sshd key-only + bore random port (stable key, 参考 long-run.yml)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
+        run: |
+          set -e
+          if [ -z "$SSH_PUBLIC_KEY" ]; then
+            echo "missing secret SSH_PUBLIC_KEY" >&2
+            exit 1
+          fi
+
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openssh-server > /dev/null
+          sudo mkdir -p /home/runner/.ssh /run/sshd
+          printf '%s\n' "$SSH_PUBLIC_KEY" | sudo tee /home/runner/.ssh/authorized_keys >/dev/null
+          sudo chown -R runner:runner /home/runner/.ssh
+          sudo chmod 700 /home/runner/.ssh
+          sudo chmod 600 /home/runner/.ssh/authorized_keys
+
+          sudo tee /etc/ssh/sshd_config.d/99-gha.conf >/dev/null <<'CFG'
+          PasswordAuthentication no
+          KbdInteractiveAuthentication no
+          ChallengeResponseAuthentication no
+          PermitRootLogin no
+          AllowUsers runner
+          PubkeyAuthentication yes
+          MaxAuthTries 3
+          ClientAliveInterval 30
+          ClientAliveCountMax 120
+          LoginGraceTime 20
+          CFG
+          sudo /usr/sbin/sshd
+
+          curl -sL https://github.com/ekzhang/bore/releases/download/v0.5.2/bore-v0.5.2-x86_64-unknown-linux-musl.tar.gz \
+            | tar xz -C /tmp
+          chmod +x /tmp/bore
+          # 后台常驻, 不阻塞后续 code-server 步骤; 保活靠主循环 + job 超时
+          nohup /tmp/bore local 22 --to bore.pub > /tmp/bore.log 2>&1 &
+          for i in $(seq 1 20); do
+            ENDPOINT=$(grep -oE 'bore\.pub:[0-9]+' /tmp/bore.log | head -1 || true)
+            [ -n "$ENDPOINT" ] && break
+            sleep 1
+          done
+          PORT=${ENDPOINT##*:}
+
+          INFO=$(cat <<EOF
+          ### SSH key-only (sshd + bore, random port)
+          host: \`bore.pub\`  port: \`${PORT}\`
+          authorized_keys from secret \`SSH_PUBLIC_KEY\` (stable)
+          \`\`\`
+          ssh -i %USERPROFILE%\\.ssh\\gha_runner_ed25519 -p ${PORT} runner@bore.pub
+          \`\`\`
+          run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          EOF
+          )
+          echo "$INFO"
+          echo "$INFO" >> "$GITHUB_STEP_SUMMARY"
+          if gh issue view 1 -R "${{ github.repository }}" >/dev/null 2>&1; then
+            gh issue reopen 1 -R "${{ github.repository }}" 2>/dev/null || true
+            gh issue edit 1 -R "${{ github.repository }}" --title "SSH bore.pub:${PORT} (key-only)" --body "$INFO"
+          else
+            gh issue create -R "${{ github.repository }}" --title "SSH bore.pub:${PORT} (key-only)" --body "$INFO" || true
+          fi
+
       - name: Install code-server (vscode server)
         run: |
           curl -fsSL https://code-server.dev/install.sh | sh
@@ -72,17 +139,14 @@ jobs:
             if ! pgrep -f "cloudflared.*tunnel.*run" > /dev/null; then
               echo "cloudflared 挂了, 重启"; nohup cloudflared tunnel --no-autoupdate run --token "$TUNNEL_TOKEN" > /tmp/cloudflared.log 2>&1 &
             fi
+            if ! pgrep -x sshd > /dev/null; then
+              echo "sshd 挂了, 重启"; sudo /usr/sbin/sshd || true
+            fi
+            if ! pgrep -f "/tmp/bore local 22" > /dev/null; then
+              echo "bore 挂了, 重启"; nohup /tmp/bore local 22 --to bore.pub > /tmp/bore.log 2>&1 &
+            fi
             if [ $((i % 30)) -eq 0 ]; then echo "heartbeat ${i}/330 min..."; fi
           done
-
-      - name: Ensure SSH keypair (per-run, archived to db)
-        run: |
-          mkdir -p ~/.ssh && chmod 700 ~/.ssh
-          if [ ! -f ~/.ssh/id_ed25519 ]; then
-            ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519 -C "run-$GITHUB_RUN_ID"
-          fi
-          chmod 600 ~/.ssh/id_ed25519 2>/dev/null || true
-          echo "ssh pubkey:"; cat ~/.ssh/id_ed25519.pub || true
 
       - name: Save creds to db private repo
         if: always()
@@ -104,11 +168,14 @@ jobs:
           printf '{"repo":"%s","run_id":"%s","run_number":"%s","ended_bj":"%s","password_len":%s,"note":"明文密码请以 VSCODE_PASSWORD secret 为准, 此处只存长度防泄漏"}\n' \
             "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$GITHUB_RUN_NUMBER" "$RUN_TS" "$PASS_LEN" > "/tmp/db/$FNAME"
           echo "$CF_TAIL" > "/tmp/db/creds/${RUN_TS}_run-${GITHUB_RUN_ID}.cf.log" || true
-          # ---- 打包 SSH + freebuff/codebuff 凭证目录 ----
+          tail -n 20 /tmp/bore.log > "/tmp/db/creds/${RUN_TS}_run-${GITHUB_RUN_ID}.bore.log" 2>/dev/null || echo "no bore log" > "/tmp/db/creds/${RUN_TS}_run-${GITHUB_RUN_ID}.bore.log"
+          # ---- 打包 SSH(仅公钥 authorized_keys, 私钥永不离本机) + bore 端口 + freebuff/codebuff 凭证目录 ----
+          # SSH 为稳定密钥制: 私钥只在本地 %USERPROFILE%\.ssh\gha_runner_ed25519, runner 上只有 authorized_keys;
+          # 当轮 bore 端口 + issue 链接一并归档, 下轮重连看 db 或 issue #1 即可.
           # freebuff 基于 codebuff, 登录态在 ~/.config/manicode/credentials.json (authToken),
           # 兼容兜底: ~/.config/codebuff ~/.config/freebuff ~/.codebuff ~/.freebuff + $CODEBUFF_DATA_DIR/$FREEBUFF_DATA_DIR
           MANIFEST="/tmp/db/creds/${RUN_TS}_run-${GITHUB_RUN_ID}.manifest.txt"
-          { echo "run $GITHUB_RUN_ID $RUN_TS"; echo "--- ssh ---"; ls -l ~/.ssh 2>/dev/null || echo "no ~/.ssh"; echo "--- cred dirs ---"; } > "$MANIFEST"
+          { echo "run $GITHUB_RUN_ID $RUN_TS"; echo "--- ssh(stable, pub only) ---"; ls -l ~/.ssh 2>/dev/null || echo "no ~/.ssh"; echo "--- bore ---"; grep -oE 'bore\.pub:[0-9]+' /tmp/bore.log 2>/dev/null | head -1 || echo "no bore endpoint"; echo "--- cred dirs ---"; } > "$MANIFEST"
           STAGE=/tmp/bundle_stage && rm -rf "$STAGE" && mkdir -p "$STAGE"
           [ -d ~/.ssh ] && mkdir -p "$STAGE/ssh" && cp -r ~/.ssh/. "$STAGE/ssh/" 2>/dev/null || true
           for d in "$HOME/.config/manicode" "$HOME/.config/manicode-dev" "$HOME/.config/manicode-staging" "$HOME/.config/codebuff" "$HOME/.config/freebuff" "$HOME/.codebuff" "$HOME/.freebuff" "${CODEBUFF_DATA_DIR:-}" "${FREEBUFF_DATA_DIR:-}"; do
