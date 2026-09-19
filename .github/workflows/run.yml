@@ -14,10 +14,11 @@ jobs:
       contents: read
       issues: write
     steps:
-      - name: sshd key-only + bore random port (stable key, 参考 long-run.yml)
+      - name: sshd key-only + bore fixed port (stable key, 参考 long-run.yml)
         env:
           GH_TOKEN: ${{ github.token }}
           SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
+          BORE_PORT: ${{ secrets.BORE_PORT }}
         run: |
           set -e
           if [ -z "$SSH_PUBLIC_KEY" ]; then
@@ -51,13 +52,29 @@ jobs:
             | tar xz -C /tmp
           chmod +x /tmp/bore
           # 后台常驻, 不阻塞后续 code-server 步骤; 保活靠主循环 + job 超时
-          nohup /tmp/bore local 22 --to bore.pub > /tmp/bore.log 2>&1 &
-          for i in $(seq 1 20); do
-            ENDPOINT=$(grep -oE 'bore\.pub:[0-9]+' /tmp/bore.log | head -1 || true)
-            [ -n "$ENDPOINT" ] && break
+          # 固定端口: --port 指定 bore.pub 远端端口 (被占则失败, 自动顺延备选)
+          WANT_PORT="${BORE_PORT:-22222}"
+          echo "$WANT_PORT" > /tmp/bore_port
+          ENDPOINT=""
+          for P in "$WANT_PORT" 22223 22224 22225 22226; do
+            echo "try bore remote port $P..."
+            echo "$P" > /tmp/bore_port
+            rm -f /tmp/bore.log
+            nohup /tmp/bore local 22 --to bore.pub --port "$P" > /tmp/bore.log 2>&1 &
+            BORE_PID=$!
+            for i in $(seq 1 15); do
+              ENDPOINT=$(grep -oE 'bore\.pub:[0-9]+' /tmp/bore.log | head -1 || true)
+              if [ -n "$ENDPOINT" ]; then break 2; fi
+              sleep 1
+            done
+            kill $BORE_PID 2>/dev/null || true
+            wait $BORE_PID 2>/dev/null || true
+            ENDPOINT=""
             sleep 1
           done
+          [ -z "$ENDPOINT" ] && echo "bore 固定端口全被占, 退出" >&2 && exit 1
           PORT=${ENDPOINT##*:}
+          echo "bore fixed at $ENDPOINT"
 
           INFO=$(cat <<EOF
           ### SSH key-only (sshd + bore, random port)
@@ -73,9 +90,9 @@ jobs:
           echo "$INFO" >> "$GITHUB_STEP_SUMMARY"
           if gh issue view 1 -R "${{ github.repository }}" >/dev/null 2>&1; then
             gh issue reopen 1 -R "${{ github.repository }}" 2>/dev/null || true
-            gh issue edit 1 -R "${{ github.repository }}" --title "SSH bore.pub:${PORT} (key-only)" --body "$INFO"
+            gh issue edit 1 -R "${{ github.repository }}" --title "SSH bore.pub:${PORT} (key-only, fixed-port)" --body "$INFO"
           else
-            gh issue create -R "${{ github.repository }}" --title "SSH bore.pub:${PORT} (key-only)" --body "$INFO" || true
+            gh issue create -R "${{ github.repository }}" --title "SSH bore.pub:${PORT} (key-only, fixed-port)" --body "$INFO" || true
           fi
 
       - name: Install code-server (vscode server)
@@ -143,7 +160,8 @@ jobs:
               echo "sshd 挂了, 重启"; sudo /usr/sbin/sshd || true
             fi
             if ! pgrep -f "/tmp/bore local 22" > /dev/null; then
-              echo "bore 挂了, 重启"; nohup /tmp/bore local 22 --to bore.pub > /tmp/bore.log 2>&1 &
+              P=$(cat /tmp/bore_port 2>/dev/null || echo 22222)
+              echo "bore 挂了, 重启(固定端口 $P)"; nohup /tmp/bore local 22 --to bore.pub --port "$P" > /tmp/bore.log 2>&1 &
             fi
             if [ $((i % 30)) -eq 0 ]; then echo "heartbeat ${i}/330 min..."; fi
           done
