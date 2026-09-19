@@ -1,0 +1,43 @@
+name: relay
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 每 30 分钟巡检一次, 只在时间窗内拉起 run.yml
+    - cron: '*/30 * * * *'
+  workflow_run:
+    workflows: ['run']
+    types: [completed]
+
+jobs:
+  relaunch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Time gate 14:00-02:00 (Beijing) + dispatch run.yml
+        env:
+          GH_TOKEN: ${{ secrets.RELAY_PAT }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -e
+          # 北京时间小时 (0-23). 允许 14:00-23:59 + 00:00-01:59, 即 14:00-26:00
+          H=$(TZ=Asia/Shanghai date +%H)
+          H=$((10#$H))
+          echo "当前北京时间: $(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M %Z')"
+          if [ "$H" -ge 14 ] || [ "$H" -lt 2 ]; then
+            echo "在窗口内 (14:00-26:00), 准备拉起 run.yml"
+          else
+            echo "不在窗口内 (只允许14:00-02:00), 拒绝拉起"
+            exit 1
+          fi
+
+          # run.yml 是否已在跑? 在跑就不重复拉
+          STATUS=$(gh api "repos/$GH_REPO/actions/workflows/run.yml/runs?per_page=1" --jq '.workflow_runs[0].status' || echo unknown)
+          echo "run.yml 最新状态: $STATUS"
+          if [ "$STATUS" = "in_progress" ] || [ "$STATUS" = "queued" ] || [ "$STATUS" = "waiting" ]; then
+            echo "run.yml 已在运行, 跳过"
+            exit 0
+          fi
+
+          gh api "repos/$GH_REPO/actions/workflows/run.yml/dispatches" -f ref=main
+          echo "已触发 run.yml"

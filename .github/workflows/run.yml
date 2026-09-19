@@ -1,0 +1,100 @@
+name: run
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 每天 10:30 北京时间 = 02:30 UTC (GitHub cron 一律 UTC)
+    - cron: '30 2 * * *'
+
+jobs:
+  vscode:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330 # 5.5h 到点强制停止
+    steps:
+      - name: Install code-server (vscode server)
+        run: |
+          curl -fsSL https://code-server.dev/install.sh | sh
+          code-server --version
+          mkdir -p ~/.config/code-server
+
+      - name: Install cloudflared
+        run: |
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb -o /tmp/cloudflared.deb
+          sudo dpkg -i /tmp/cloudflared.deb
+          cloudflared --version
+
+      - name: Install freebuff (every run)
+        run: |
+          npm install -g freebuff
+          freebuff --version || npx freebuff --version || true
+
+      - name: Start code-server + cloudflare tunnel (5.5h)
+        env:
+          TUNNEL_TOKEN: ${{ secrets.TUNNEL_TOKEN }}
+          VSCODE_PASSWORD: ${{ secrets.VSCODE_PASSWORD }}
+        run: |
+          set -e
+          PASS="${VSCODE_PASSWORD:-vscode123}"
+          printf "bind-addr: 0.0.0.0:8080\nauth: password\npassword: %s\ncert: false\n" "$PASS" > ~/.config/code-server/config.yaml
+          chmod 600 ~/.config/code-server/config.yaml
+
+          # 本次运行凭证 (不回显 token 全文)
+          RUN_TS=$(TZ=Asia/Shanghai date '+%Y-%m-%d_%H-%M')
+          echo "$RUN_TS $GITHUB_RUN_ID" > /tmp/run_id.txt
+          printf '{"repo":"%s","run_id":"%s","run_number":"%s","started_bj":"%s","public_hint":"Cloudflare Zero Trust > Tunnels > Public Hostname -> http://localhost:8080"}\n' \
+            "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$GITHUB_RUN_NUMBER" "$RUN_TS" > /tmp/creds.json
+          echo "VSCODE_PASSWORD 已写入 config, 明文只存 db 私有仓, 日志不打印"
+
+          # 1) 起 code-server
+          nohup code-server --bind-addr 0.0.0.0:8080 > /tmp/code-server.log 2>&1 &
+          sleep 5
+
+          # 2) 起 cloudflared 命名隧道 (公网 -> localhost:8080)
+          nohup cloudflared tunnel --no-autoupdate run --token "$TUNNEL_TOKEN" > /tmp/cloudflared.log 2>&1 &
+          sleep 8
+
+          echo "==================== 连接信息(只看这里) ===================="
+          echo "公网地址: 去 Cloudflare Zero Trust > Networks > Tunnels 看你绑定的 Public Hostname"
+          echo "  (隧道指向 http://localhost:8080, 密码 = VSCODE_PASSWORD)"
+          echo "本地 code-server 自检:"
+          curl -s -o /dev/null -w "  localhost:8080 HTTP %{http_code}\n" http://localhost:8080/ || true
+          echo "cloudflared 日志尾:"
+          tail -n 20 /tmp/cloudflared.log || true
+          echo "============================================================="
+
+          # 3) 保活 5.5h = 19800s, 到点 job 因 timeout-minutes:330 自动结束
+          echo "保活开始: 19800s (5.5h)..."
+          for i in $(seq 1 330); do
+            sleep 60
+            if ! pgrep -f "code-server.*0.0.0.0:8080" > /dev/null; then
+              echo "code-server 挂了, 重启"; nohup code-server --bind-addr 0.0.0.0:8080 > /tmp/code-server.log 2>&1 &
+            fi
+            if ! pgrep -f "cloudflared.*tunnel.*run" > /dev/null; then
+              echo "cloudflared 挂了, 重启"; nohup cloudflared tunnel --no-autoupdate run --token "$TUNNEL_TOKEN" > /tmp/cloudflared.log 2>&1 &
+            fi
+            if [ $((i % 30)) -eq 0 ]; then echo "heartbeat ${i}/330 min..."; fi
+          done
+
+      - name: Save creds to db private repo
+        if: always()
+        env:
+          DB_PUSH_PAT: ${{ secrets.DB_PUSH_PAT }}
+          VSCODE_PASSWORD: ${{ secrets.VSCODE_PASSWORD }}
+        run: |
+          set -e
+          [ -z "$DB_PUSH_PAT" ] && echo "DB_PUSH_PAT 为空, 跳过归档" && exit 0
+          OWNER="${GITHUB_REPOSITORY%%/*}"
+          DB_REPO="$OWNER/db"
+          RUN_TS=$(TZ=Asia/Shanghai date '+%Y-%m-%d_%H-%M')
+          FNAME="creds/${RUN_TS}_run-${GITHUB_RUN_ID}.json"
+          rm -rf /tmp/db && git clone "https://x-access-token:${DB_PUSH_PAT}@github.com/${DB_REPO}.git" /tmp/db
+          mkdir -p /tmp/db/creds
+          PASS_LEN=$(printf "%s" "${VSCODE_PASSWORD:-vscode123}" | wc -c)
+          tail -n 50 /tmp/cloudflared.log > /tmp/cf_tail.log 2>/dev/null || true
+          CF_TAIL=$(tr -d '\n' < /tmp/cf_tail.log | cut -c1-2000)
+          printf '{"repo":"%s","run_id":"%s","run_number":"%s","ended_bj":"%s","password_len":%s,"note":"明文密码请以 VSCODE_PASSWORD secret 为准, 此处只存长度防泄漏"}\n' \
+            "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$GITHUB_RUN_NUMBER" "$RUN_TS" "$PASS_LEN" > "/tmp/db/$FNAME"
+          echo "$CF_TAIL" > "/tmp/db/creds/${RUN_TS}_run-${GITHUB_RUN_ID}.cf.log" || true
+          cd /tmp/db && git config user.name "relay-bot" && git config user.email "relay-bot@local"
+          git add . && git commit -m "creds run $GITHUB_RUN_ID $RUN_TS" || echo "nothing to commit"
+          git push origin HEAD:main || git push origin HEAD:master || true
