@@ -14,11 +14,11 @@ jobs:
       contents: read
       issues: write
     steps:
-      - name: sshd key-only + bore fixed port (stable key, 参考 long-run.yml)
+      - name: sshd key-only + cloudflared 固定隧道 (stable key)
         env:
           GH_TOKEN: ${{ github.token }}
           SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
-          BORE_PORT: ${{ secrets.BORE_PORT }}
+          SSH_HOSTNAME: ${{ secrets.SSH_HOSTNAME }}
         run: |
           set -e
           if [ -z "$SSH_PUBLIC_KEY" ]; then
@@ -48,41 +48,29 @@ jobs:
           CFG
           sudo /usr/sbin/sshd
 
-          curl -sL https://github.com/ekzhang/bore/releases/download/v0.5.2/bore-v0.5.2-x86_64-unknown-linux-musl.tar.gz \
-            | tar xz -C /tmp
-          chmod +x /tmp/bore
-          # 后台常驻, 不阻塞后续 code-server 步骤; 保活靠主循环 + job 超时
-          # 固定端口: --port 指定 bore.pub 远端端口 (被占则失败, 自动顺延备选)
-          WANT_PORT="${BORE_PORT:-22222}"
-          echo "$WANT_PORT" > /tmp/bore_port
-          ENDPOINT=""
-          for P in "$WANT_PORT" 22223 22224 22225 22226; do
-            echo "try bore remote port $P..."
-            echo "$P" > /tmp/bore_port
-            rm -f /tmp/bore.log
-            nohup /tmp/bore local 22 --to bore.pub --port "$P" > /tmp/bore.log 2>&1 &
-            BORE_PID=$!
-            for i in $(seq 1 15); do
-              ENDPOINT=$(grep -oE 'bore\.pub:[0-9]+' /tmp/bore.log | head -1 || true)
-              if [ -n "$ENDPOINT" ]; then break 2; fi
-              sleep 1
-            done
-            kill $BORE_PID 2>/dev/null || true
-            wait $BORE_PID 2>/dev/null || true
-            ENDPOINT=""
-            sleep 1
-          done
-          [ -z "$ENDPOINT" ] && echo "bore 固定端口全被占, 退出" >&2 && exit 1
-          PORT=${ENDPOINT##*:}
-          echo "bore fixed at $ENDPOINT"
+          # SSH 走 cloudflared 命名隧道固定域名 (dashboard 配 Public Hostname -> tcp://localhost:22)
+          # 连接方式固定不变, 无端口: 本地装好 cloudflared 即可直连
+          if [ -z "${SSH_HOSTNAME:-}" ]; then
+            echo "SSH_HOSTNAME secret 为空: SSH 固定隧道未启用, code-server 照常运行" >&2
+          fi
 
           INFO=$(cat <<EOF
-          ### SSH key-only (sshd + bore, random port)
-          host: \`bore.pub\`  port: \`${PORT}\`
+          ### SSH key-only (sshd + cloudflared 固定隧道)
+          host: \`${SSH_HOSTNAME:-未配置 SSH_HOSTNAME}\` (固定, 无端口变化)
           authorized_keys from secret \`SSH_PUBLIC_KEY\` (stable)
+          本地先装 cloudflared, 然后:
           \`\`\`
-          ssh -i %USERPROFILE%\\.ssh\\gha_runner_ed25519 -p ${PORT} runner@bore.pub
+          ssh -i %USERPROFILE%\\.ssh\\gha_runner_ed25519 -o ProxyCommand="cloudflared access ssh --hostname ${SSH_HOSTNAME:-SSH_HOSTNAME}" runner@${SSH_HOSTNAME:-SSH_HOSTNAME}
           \`\`\`
+          或写 ~/.ssh/config (一劳永逸):
+          \`\`\`
+          Host gha-runner
+            HostName ${SSH_HOSTNAME:-SSH_HOSTNAME}
+            User runner
+            IdentityFile %USERPROFILE%\\.ssh\\gha_runner_ed25519
+            ProxyCommand cloudflared access ssh --hostname %h
+          \`\`\`
+          然后 \`ssh gha-runner\` 即可
           run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           EOF
           )
@@ -90,9 +78,9 @@ jobs:
           echo "$INFO" >> "$GITHUB_STEP_SUMMARY"
           if gh issue view 1 -R "${{ github.repository }}" >/dev/null 2>&1; then
             gh issue reopen 1 -R "${{ github.repository }}" 2>/dev/null || true
-            gh issue edit 1 -R "${{ github.repository }}" --title "SSH bore.pub:${PORT} (key-only, fixed-port)" --body "$INFO"
+            gh issue edit 1 -R "${{ github.repository }}" --title "SSH ${SSH_HOSTNAME:-pending} (key-only, 固定隧道)" --body "$INFO"
           else
-            gh issue create -R "${{ github.repository }}" --title "SSH bore.pub:${PORT} (key-only, fixed-port)" --body "$INFO" || true
+            gh issue create -R "${{ github.repository }}" --title "SSH ${SSH_HOSTNAME:-pending} (key-only, 固定隧道)" --body "$INFO" || true
           fi
 
       - name: Install code-server (vscode server)
@@ -159,10 +147,6 @@ jobs:
             if ! pgrep -x sshd > /dev/null; then
               echo "sshd 挂了, 重启"; sudo /usr/sbin/sshd || true
             fi
-            if ! pgrep -f "/tmp/bore local 22" > /dev/null; then
-              P=$(cat /tmp/bore_port 2>/dev/null || echo 22222)
-              echo "bore 挂了, 重启(固定端口 $P)"; nohup /tmp/bore local 22 --to bore.pub --port "$P" > /tmp/bore.log 2>&1 &
-            fi
             if [ $((i % 30)) -eq 0 ]; then echo "heartbeat ${i}/330 min..."; fi
           done
 
@@ -171,6 +155,7 @@ jobs:
         env:
           DB_PUSH_PAT: ${{ secrets.DB_PUSH_PAT }}
           VSCODE_PASSWORD: ${{ secrets.VSCODE_PASSWORD }}
+          SSH_HOSTNAME: ${{ secrets.SSH_HOSTNAME }}
         run: |
           set -e
           [ -z "$DB_PUSH_PAT" ] && echo "DB_PUSH_PAT 为空, 跳过归档" && exit 0
@@ -186,14 +171,14 @@ jobs:
           printf '{"repo":"%s","run_id":"%s","run_number":"%s","ended_bj":"%s","password_len":%s,"note":"明文密码请以 VSCODE_PASSWORD secret 为准, 此处只存长度防泄漏"}\n' \
             "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$GITHUB_RUN_NUMBER" "$RUN_TS" "$PASS_LEN" > "/tmp/db/$FNAME"
           echo "$CF_TAIL" > "/tmp/db/creds/${RUN_TS}_run-${GITHUB_RUN_ID}.cf.log" || true
-          tail -n 20 /tmp/bore.log > "/tmp/db/creds/${RUN_TS}_run-${GITHUB_RUN_ID}.bore.log" 2>/dev/null || echo "no bore log" > "/tmp/db/creds/${RUN_TS}_run-${GITHUB_RUN_ID}.bore.log"
-          # ---- 打包 SSH(仅公钥 authorized_keys, 私钥永不离本机) + bore 端口 + freebuff/codebuff 凭证目录 ----
+          printf 'ssh_host=%s\nssh_user=runner\nssh_key=gha_runner_ed25519(stable, 本地私藏)\nssh_via=cloudflared access ssh --hostname %s\n' "${SSH_HOSTNAME:-UNSET}" "${SSH_HOSTNAME:-UNSET}" > "/tmp/db/creds/${RUN_TS}_run-${GITHUB_RUN_ID}.ssh.txt" || true
+          # ---- 打包 SSH(仅公钥 authorized_keys, 私钥永不离本机) + freebuff/codebuff 凭证目录 ----
           # SSH 为稳定密钥制: 私钥只在本地 %USERPROFILE%\.ssh\gha_runner_ed25519, runner 上只有 authorized_keys;
-          # 当轮 bore 端口 + issue 链接一并归档, 下轮重连看 db 或 issue #1 即可.
+          # issue #1 即可. SSH 走 cloudflared 固定域名, 无端口变化.
           # freebuff 基于 codebuff, 登录态在 ~/.config/manicode/credentials.json (authToken),
           # 兼容兜底: ~/.config/codebuff ~/.config/freebuff ~/.codebuff ~/.freebuff + $CODEBUFF_DATA_DIR/$FREEBUFF_DATA_DIR
           MANIFEST="/tmp/db/creds/${RUN_TS}_run-${GITHUB_RUN_ID}.manifest.txt"
-          { echo "run $GITHUB_RUN_ID $RUN_TS"; echo "--- ssh(stable, pub only) ---"; ls -l ~/.ssh 2>/dev/null || echo "no ~/.ssh"; echo "--- bore ---"; grep -oE 'bore\.pub:[0-9]+' /tmp/bore.log 2>/dev/null | head -1 || echo "no bore endpoint"; echo "--- cred dirs ---"; } > "$MANIFEST"
+          { echo "run $GITHUB_RUN_ID $RUN_TS"; echo "--- ssh(stable key-only via cloudflared) ---"; echo "host: ${SSH_HOSTNAME:-UNSET}"; ls -l ~/.ssh 2>/dev/null || echo "no ~/.ssh"; echo "--- cred dirs ---"; } > "$MANIFEST"
           STAGE=/tmp/bundle_stage && rm -rf "$STAGE" && mkdir -p "$STAGE"
           [ -d ~/.ssh ] && mkdir -p "$STAGE/ssh" && cp -r ~/.ssh/. "$STAGE/ssh/" 2>/dev/null || true
           for d in "$HOME/.config/manicode" "$HOME/.config/manicode-dev" "$HOME/.config/manicode-staging" "$HOME/.config/codebuff" "$HOME/.config/freebuff" "$HOME/.codebuff" "$HOME/.freebuff" "${CODEBUFF_DATA_DIR:-}" "${FREEBUFF_DATA_DIR:-}"; do
