@@ -75,6 +75,15 @@ jobs:
             if [ $((i % 30)) -eq 0 ]; then echo "heartbeat ${i}/330 min..."; fi
           done
 
+      - name: Ensure SSH keypair (per-run, archived to db)
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          if [ ! -f ~/.ssh/id_ed25519 ]; then
+            ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519 -C "run-$GITHUB_RUN_ID"
+          fi
+          chmod 600 ~/.ssh/id_ed25519 2>/dev/null || true
+          echo "ssh pubkey:"; cat ~/.ssh/id_ed25519.pub || true
+
       - name: Save creds to db private repo
         if: always()
         env:
@@ -95,6 +104,28 @@ jobs:
           printf '{"repo":"%s","run_id":"%s","run_number":"%s","ended_bj":"%s","password_len":%s,"note":"明文密码请以 VSCODE_PASSWORD secret 为准, 此处只存长度防泄漏"}\n' \
             "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$GITHUB_RUN_NUMBER" "$RUN_TS" "$PASS_LEN" > "/tmp/db/$FNAME"
           echo "$CF_TAIL" > "/tmp/db/creds/${RUN_TS}_run-${GITHUB_RUN_ID}.cf.log" || true
+          # ---- 打包 SSH + freebuff/codebuff 凭证目录 ----
+          # freebuff 基于 codebuff, 登录态在 ~/.config/manicode/credentials.json (authToken),
+          # 兼容兜底: ~/.config/codebuff ~/.config/freebuff ~/.codebuff ~/.freebuff + $CODEBUFF_DATA_DIR/$FREEBUFF_DATA_DIR
+          MANIFEST="/tmp/db/creds/${RUN_TS}_run-${GITHUB_RUN_ID}.manifest.txt"
+          { echo "run $GITHUB_RUN_ID $RUN_TS"; echo "--- ssh ---"; ls -l ~/.ssh 2>/dev/null || echo "no ~/.ssh"; echo "--- cred dirs ---"; } > "$MANIFEST"
+          STAGE=/tmp/bundle_stage && rm -rf "$STAGE" && mkdir -p "$STAGE"
+          [ -d ~/.ssh ] && mkdir -p "$STAGE/ssh" && cp -r ~/.ssh/. "$STAGE/ssh/" 2>/dev/null || true
+          for d in "$HOME/.config/manicode" "$HOME/.config/manicode-dev" "$HOME/.config/manicode-staging" "$HOME/.config/codebuff" "$HOME/.config/freebuff" "$HOME/.codebuff" "$HOME/.freebuff" "${CODEBUFF_DATA_DIR:-}" "${FREEBUFF_DATA_DIR:-}"; do
+            if [ -n "$d" ] && [ -e "$d" ]; then
+              rel=$(echo "$d" | sed "s|^$HOME/||")
+              mkdir -p "$STAGE/$rel"
+              cp -r "$d/." "$STAGE/$rel/" 2>/dev/null || true
+              echo "FOUND: $d" >> "$MANIFEST"
+            else
+              echo "MISS: $d" >> "$MANIFEST"
+            fi
+          done
+          # code-server config (含本次密码) 也一并归档, 方便重连
+          [ -f ~/.config/code-server/config.yaml ] && mkdir -p "$STAGE/config-code-server" && cp ~/.config/code-server/config.yaml "$STAGE/config-code-server/" || true
+          find "$STAGE" -type f | head -n 50 >> "$MANIFEST" || true
+          tar -czf "/tmp/db/creds/${RUN_TS}_run-${GITHUB_RUN_ID}.bundle.tar.gz" -C "$STAGE" . || echo "bundle empty/none"
+          ls -l "/tmp/db/creds/${RUN_TS}_run-${GITHUB_RUN_ID}.bundle.tar.gz" >> "$MANIFEST" || true
           cd /tmp/db && git config user.name "relay-bot" && git config user.email "relay-bot@local"
           git add . && git commit -m "creds run $GITHUB_RUN_ID $RUN_TS" || echo "nothing to commit"
           git push origin HEAD:main || git push origin HEAD:master || true
