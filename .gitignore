@@ -2,3 +2,5 @@
 .omc/
 vps.txt
 .ssh-keys/
+.cloudflared-token
+mcp-local/
