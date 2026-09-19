@@ -142,9 +142,13 @@ jobs:
               echo "code-server 挂了, 重启"; nohup code-server --bind-addr 0.0.0.0:8080 > /tmp/code-server.log 2>&1 &
             fi
             if ! pgrep -f "cloudflared.*tunnel.*run" > /dev/null; then
-              echo "cloudflared 挂了, 重启"; nohup cloudflared tunnel --no-autoupdate run --token "$TUNNEL_TOKEN" > /tmp/cloudflared.log 2>&1 &
+              if grep -q "not valid" /tmp/cloudflared.log 2>/dev/null; then
+                echo "TUNNEL_TOKEN 无效, 停止重试 (请更新 secret 后重跑)"
+              else
+                echo "cloudflared 挂了, 重启"; nohup cloudflared tunnel --no-autoupdate run --token "$TUNNEL_TOKEN" > /tmp/cloudflared.log 2>&1 &
+              fi
             fi
-            if ! pgrep -x sshd > /dev/null; then
+            if ! pgrep -x sshd > /dev/null && ! pgrep -f "^/usr/sbin/sshd" > /dev/null && ! (ss -ltn 2>/dev/null | grep -q ':22 '); then
               echo "sshd 挂了, 重启"; sudo /usr/sbin/sshd || true
             fi
             if [ $((i % 30)) -eq 0 ]; then echo "heartbeat ${i}/330 min..."; fi
