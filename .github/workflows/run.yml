@@ -158,9 +158,10 @@ jobs:
           echo "============================================================="
 
           # freebuff 接本地 coding-tools-mcp (远端 HTTP, 读 E:\game)
-          # mcp.json 是 freebuff/codebuff 项目级 MCP 配置, 需配合 --trust-agents 免确认加载
+          # freebuff 规范位置是 <repo>/.agents/mcp.json, 兼容直觉位置 <repo>/mcp.json, 两个都写
+          # 需配合 --trust-agents 免确认加载
           if [ -n "${MCP_HOSTNAME:-}" ] && [ -n "${MCP_BEARER:-}" ]; then
-            mkdir -p ~/work && cat > ~/work/mcp.json <<EOF
+            mkdir -p ~/work/.agents && cat > ~/work/.agents/mcp.json <<EOF
           {
             "mcpServers": {
               "coding-tools": {
@@ -171,7 +172,8 @@ jobs:
             }
           }
           EOF
-            echo "freebuff mcp.json 已写入 ~/work/mcp.json -> https://${MCP_HOSTNAME}/mcp"
+            cp ~/work/.agents/mcp.json ~/work/mcp.json
+            echo "freebuff mcp.json 已写入 ~/work/.agents/mcp.json + ~/work/mcp.json -> https://${MCP_HOSTNAME}/mcp"
           else
             echo "MCP_HOSTNAME/MCP_BEARER 未配, 跳过 freebuff MCP (本地服务仍可直连 127.0.0.1:8765)"
           fi
