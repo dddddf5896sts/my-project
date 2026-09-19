@@ -100,6 +100,27 @@ jobs:
           npm install -g freebuff
           freebuff --version || npx freebuff --version || true
 
+      - name: Pre-install VS Code Server for Remote-SSH
+        env:
+          VSCODE_SERVER_COMMIT: ${{ secrets.VSCODE_SERVER_COMMIT }}
+        run: |
+          # 与本地 VSCode commit 对应的 server, 首连免下载; 本地升级后首连会自动重下一次, 属正常
+          # commit 查看: 本地 VSCode -> Help -> About -> Commit
+          COMMIT="${VSCODE_SERVER_COMMIT:-7debcd0e2acdea1c52de81bf9ee1620444407dda}"
+          DEST="$HOME/.vscode-server/cli/servers/Stable-$COMMIT"
+          if [ -x "$DEST/server/bin/code-server" ]; then
+            echo "vscode-server 已预装: $DEST"
+          else
+            curl -fsSL "https://update.code.visualstudio.com/commit:$COMMIT/server-linux-x64/stable" -o /tmp/vscode-server.tar.gz
+            mkdir -p "$DEST"
+            rm -rf "$DEST/server" /tmp/vscode-server-linux-x64
+            tar xzf /tmp/vscode-server.tar.gz -C /tmp
+            mv /tmp/vscode-server-linux-x64 "$DEST/server"
+            rm -f /tmp/vscode-server.tar.gz
+            echo "vscode-server 预装完成:"
+            ls "$DEST/server" && du -sh "$DEST"
+          fi
+
       - name: Start code-server + cloudflare tunnel (5.5h)
         env:
           TUNNEL_TOKEN: ${{ secrets.TUNNEL_TOKEN }}
